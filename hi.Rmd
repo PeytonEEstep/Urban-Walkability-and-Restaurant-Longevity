@@ -1,0 +1,2566 @@
+---
+title: "Directed Study"
+author: "Peyton Estep"
+date: "2025-09-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r, warning = FALSE}
+
+# loading in libraries
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(httr)
+library(jsonlite)
+library(sf)
+library(tigris)
+library(progress)
+library(viridis)
+library(patchwork)
+library(tidycensus)
+library(stringr)
+library(jsonlite)
+library(readr)
+library(spdep)
+library(sp)
+library(FNN)
+library(purrr)
+library(lubridate)
+library(httr2)
+```
+
+
+
+
+
+
+
+
+
+
+
+GETTING WALKABILITY DATA 
+
+
+```{r}
+# Loading in walkability data
+
+get_walkscore <- function(lat, lon, address, api_key) {
+  url <- paste0("https://api.walkscore.com/score?format=json&address=",
+                URLencode(address), "&lat=", lat, "&lon=", lon, "&wsapikey=", api_key)
+  response <- GET(url)
+  content <- fromJSON(content(response, "text", encoding = "UTF-8"))
+  return(content)
+}
+
+```
+
+```{r}
+
+# setting walk score api key
+
+api_key = "cd31a2e1ded4ea6447fd05acdb5d1d80"
+
+# cities of interest
+
+cities <- c("Lakewood", "Berea", "Maple Heights", "North Royalton", "Strongsville")
+
+# FIPS codes
+
+state_abbrev = "OH"
+county_name = "Cuyahoga"
+
+```
+
+```{r}
+
+# downloading blocks and places
+
+message("Downloading place polygons and blocks (may take a minute)...")
+
+places_df <- places(state = state_abbrev, year = 2020, class = "sf") %>%
+  st_transform(4326)
+
+
+blocks_sf <- blocks(state = state_abbrev, county = county_name, year = 2020, class = "sf") %>%
+  st_transform(4326)
+
+
+```
+
+```{r}
+
+# filtering place polygons to cities of interest
+
+cities_sf <- places_df %>%
+  filter(NAME %in% cities) %>%
+  st_transform(4326)
+
+if(nrow(cities_sf) == 0) stop("No place polygons found")
+
+```
+
+```{r}
+
+# joining blocks with place polygons to get blocks inside each city
+
+message("Intersection blocks with place polygons...")
+
+blocks_in_places <- st_join(blocks_sf, cities_sf %>%
+      select(NAME), join = st_intersects, left = FALSE)
+      
+# if left = FALSE doesn't return some blocks
+
+if(nrow(blocks_in_places) == 0) {
+  blocks_in_places <- st_join(blocks_sf, cities_sf %>% select(NAME), join = st_intersects, left = TRUE) %>%
+    filter(!is.na(NAME))
+}
+
+message(sprintf("Found %d blocks inside the target places", nrow(blocks_in_places)))
+
+```
+
+```{r}
+
+# computing centroids for each blocks
+
+blocks_centroids <- blocks_in_places %>%
+  st_centroid()
+
+
+# extracting coordinates
+
+coords <- st_coordinates(blocks_centroids)
+
+```
+
+```{r}
+
+# preparing a dataframe for API request
+
+blocks_req <- blocks_centroids %>%
+  mutate(GEOID = GEOID20,
+         place_name = NAME,
+         lon = coords[,1],
+         lat = coords[,2]) %>%
+  st_drop_geometry() %>%
+  distinct()
+
+# showing how many requests I'll make
+
+n_requests = nrow(blocks_req)
+message(sprintf("Will make %d requests", n_requests))
+
+
+```
+
+
+
+```{r}
+
+# output file
+
+output_file <- "walkscore_results.csv"
+
+# if output files exists, load it to continue from last completed request
+
+if(file.exists(output_file)) {
+  walkscore_results <- read.csv(output_file, stringsAsFactors = FALSE)
+  
+  # ensuring GEOID is a character
+  walkscore_results$GEOID <- as.character(walkscore_results$GEOID)
+  
+  completed_geoids <- walkscore_results$GEOID
+} else {
+  walkscore_results <- data.frame()
+  completed_geoids <- character(0)
+}
+
+# looping through all blocks
+
+for(i in seq_len(nrow(blocks_req))) {
+  
+  block <- blocks_req[i, ]
+  
+  # skipping blocks already processed
+  
+  if(block$GEOID %in% completed_geoids) next
+  
+  # building API URL
+  
+  api_url <- paste0(
+    "https://api.walkscore.com/score?format=json",
+    "&lat=", block$lat,
+    "&lon=", block$lon,
+    "&address=", URLencode(block$place_name),
+    "&wsapikey=", api_key
+  )
+  
+  # making the API request
+  
+  res <- tryCatch({
+    httr::GET(api_url)
+  }, error = function(e) {
+    message(sprintf("Error for GEOID %s: %s", block$GEOID, e$message))
+    return(NULL)
+  })
+  
+  if(!is.null(res) && status_code(res) == 200) {
+    content_json <- content(res, as = "text", encoding = "UTF-8")
+    content_list <- fromJSON(content_json)
+    
+    walkscore_val <- if(is.list(content_list) && "walkscore" %in% names(content_list)) {
+      content_list$walkscore
+    } else {
+      NA
+    }
+    
+    description_val <- if(is.list(content_list) && "description" %in% names(content_list)) {
+      content_list$description
+    } else {
+      NA
+    }
+    
+    # extracting relevant info
+    ws_data <- data.frame(
+      GEOID = as.character(block$GEOID),
+      city = as.character(block$place_name),
+      walkscore = as.numeric(walkscore_val),
+      description = as.character(description_val),
+      stringsAsFactors = FALSE
+    )
+    
+    # appending to results
+    
+    walkscore_results <- bind_rows(walkscore_results, ws_data)
+    
+    # saving after each request (incremental)
+    
+    write.csv(walkscore_results, output_file, row.names = FALSE)
+    
+    message(sprintf("Processed %d/%d: GEOID %s", i, nrow(blocks_req), block$GEOID))
+    
+    # pausing to avoid hitting API limits
+    
+    Sys.sleep(0.5)
+  } else {
+    message(sprintf("Failed request for GEOID %s, status: %s", block$GEOID, status_code(res)))
+  }
+}
+
+message("All blocks processed!")
+
+
+```
+
+
+```{r}
+
+# getting block data
+
+options(tigris_use_cache = TRUE)
+
+state_abbrev <- "OH"
+county_name <- "Cuyahoga"
+cities <- c("Lakewood", "Berea", "Maple Heights", "North Royalton", "Strongsville")
+
+places_df <- places(state = state_abbrev, year = 2020, class = "sf") %>%
+  st_transform(4326) %>%
+  filter(NAME %in% cities)
+
+county_shape <- counties(state = state_abbrev, year = 2020, class = "sf") %>%
+  filter(NAME == county_name) %>%
+  st_transform(4326)
+
+blocks_sf <- blocks(state = state_abbrev, county = county_name, year = 2020, class = "sf") %>%
+  st_transform(4326) %>%
+  st_filter(places_df)
+
+blocks_in_places <- st_join(blocks_sf, places_df %>% select(NAME), join = st_intersects, left = FALSE)
+
+
+```
+
+```{r}
+
+# saving blocks_in_places as shapefile
+
+st_write(blocks_in_places, "blocks_in_places.gpkg", delete_dsn = TRUE)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GETTING POPULATION DATA FOR EACH BLOCK
+
+```{r}
+
+
+# intializing my api key
+
+census_api_key("d8b3b3939b81348edb2b3a6945f091b1217bd5ea", install = TRUE)
+
+# getting population + geometry
+
+pop_data <- get_decennial(
+  geography = "block",
+  # total population ACS variable
+  variables = "P1_001N",
+  state = "OH",
+  county = "CUYAHOGA",
+  year = 2020,
+  dataset = "pl",
+  geometry = FALSE
+)
+
+# pulling block geometries separately from TIGER
+
+pop_data_geom <- blocks(state = "OH", county = "Cuyahoga", year = 2020) %>%
+  st_transform(4326)
+
+# renaming GEOID column
+
+pop_data_geom <- pop_data_geom %>%
+  rename(GEOID = GEOID20) %>%
+  mutate(GEOID = as.character(GEOID))
+
+
+```
+
+```{r}
+
+# merging population and geometry data
+
+pop_blocks <- left_join(pop_data_geom, pop_data, by = "GEOID")
+
+# removing duplicate rows
+pop_blocks <- pop_blocks %>%
+  group_by(GEOID) %>%
+  slice(1) %>%
+  ungroup()
+
+
+```
+
+```{r}
+
+cities_sf <- places(state = "OH", year = 2020) %>%
+  filter(NAME %in% c("Lakewood", "Berea", "Maple Heights", "North Royalton", "Strongsville")) %>%
+  st_transform(4326)
+
+```
+
+```{r}
+
+# performing spatial join to assign each block to its city
+
+pop_blocks <- st_join(pop_blocks, cities_sf["NAME"], left = FALSE)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GETTING BUSINESS DATA
+
+
+
+```{r}
+
+business_2023 = read.csv("zbp23detail.txt")
+
+business_2022 = read.csv("zbp22detail.txt")
+
+business_2021 = read.csv("zbp21detail.txt")
+
+business_2020 = read.csv("zbp20detail.txt")
+
+business_2019 = read.csv("zbp19detail.txt")
+
+business_2018 = read.csv("zbp18detail.txt")
+
+business_2017 = read.csv("zbp17detail.txt")
+
+business_2016 = read.csv("zbp16detail.txt")
+
+business_2015 = read.csv("zbp15detail.txt")
+
+business_2014 = read.csv("zbp14detail.txt")
+
+business_2013 = read.csv("zbp13detail.txt")
+
+business_2012 = read.csv("zbp12detail.txt")
+
+business_2011 = read.csv("zbp11detail.txt")
+
+business_2010 = read.csv("zbp10detail.txt")
+
+business_2009 = read.csv("zbp09detail.txt")
+
+business_2008 = read.csv("zbp08detail.txt")
+
+business_2007 = read.csv("zbp07detail.txt")
+
+business_2006 = read.csv("zbp06detail.txt")
+
+business_2005 = read.csv("zbp05detail.txt")
+
+business_2004 = read.csv("zbp04detail.txt")
+
+business_2003 = read.csv("zbp03detail.txt")
+
+business_2002 = read.csv("zbp02detail.txt")
+
+business_2001 = read.csv("zbp01detail.txt")
+
+business_2000 = read.csv("zbp00detail.txt")
+
+business_1999 = read.csv("zbp99detail.txt")
+
+business_1998 = read.csv("zbp98detail.txt")
+
+business_1997 = read.csv("zbp97detail.txt")
+
+business_1996 = read.csv("zbp96detail.txt")
+
+business_1995 = read.csv("zbp95detail.txt")
+
+business_1994 = read.csv("zbp94detail.txt")
+
+
+
+```
+
+
+
+
+
+
+
+
+Filtering rows that contain the cities I need (2019-2023)
+
+```{r}
+
+years <- 2019:2023
+business_list <- mget(paste0("business_", years))
+
+business_list <- lapply(business_list, function(df) {
+  df %>%
+    filter(grepl("Lakewood|Berea|North Royalton|Maple Heights|Strongsville", name, ignore.case = TRUE)) %>%
+    separate(name, into = c("city", "state"), sep = ",\\s*")
+})
+
+list2env(business_list, envir = .GlobalEnv)
+
+# removing non-ohio cites
+business_list <- lapply(business_list, function(df) {
+  df %>%
+    filter(state == "OH")
+})
+
+list2env(business_list, envir = .GlobalEnv)
+
+
+
+```
+
+Dealing with the datasets with no "name" column (1994-2018). The datasets for the year 1994-2018 only have zip code data, so I had to filter those datasets based on the zip codes instead of the city names.
+
+```{r}
+
+# initializing zip code variables
+
+lakewood_zips <- c("44107", "44111", "44116")
+berea_zips <- c("44017")
+mapleheights_zips <- c("44137")
+northroyalton_zips <- c("44133")
+strongsville_zips <- c("44017", "44136", "44149")
+
+# getting datasets for 1994-2018
+
+years_old <- 1994:2018
+
+business_list_old <- mget(paste0("business_", years_old))
+
+# filtering and adding city + state columns
+
+business_list_old <- lapply(business_list_old, function(df){
+  
+  # detecting the zip column
+  zip_col <- names(df)[tolower(names(df)) == "zip"]
+  
+  if(length(zip_col) == 0) stop("No zip code found")
+  
+  df <- df %>%
+    rename(zip = all_of(zip_col)) %>%
+    mutate(zip = as.character(zip)) %>%
+    filter(zip %in% c(lakewood_zips, berea_zips, northroyalton_zips, mapleheights_zips, strongsville_zips)) %>%
+    mutate(
+      city = case_when(
+        zip %in% lakewood_zips ~ "LAKEWOOD",
+        zip %in% berea_zips ~ "BEREA",
+        zip %in% northroyalton_zips ~ "NORTH ROYALTON",
+        zip %in% mapleheights_zips ~ "MAPLE HEIGHTS",
+        zip %in% strongsville_zips ~ "STRONGSVILLE",
+        TRUE ~ NA_character_
+      ),
+      state = "OH"
+    )
+  return(df)
+})
+
+list2env(business_list_old, envir = .GlobalEnv)
+
+```
+
+
+
+
+
+
+
+
+
+
+Attempting to combine all the data together
+
+```{r}
+
+# forcing all columns to character
+standardize_cols <- function(df) {
+  df %>% mutate(across(everything(), as.character))
+}
+
+business_list_old_std <- lapply(business_list_old, standardize_cols)
+
+business_list_std <- lapply(business_list, standardize_cols)
+
+```
+
+
+```{r}
+
+# adding a year column and binding all the years together
+
+business_all <- bind_rows(
+  lapply(seq_along(business_list_old_std), function(i) {
+    year <- years_old[i]
+    df <- business_list_old_std[[i]]
+    df %>% mutate(year = year)
+  }),
+  lapply(seq_along(business_list_std), function(i) {
+    year <- years[i]
+    df <- business_list_std[[i]]
+    df %>% mutate(year = year)
+  })
+)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CLEANING UP THE DATASETS
+
+```{r}
+
+# removing repeat columns
+
+# making all columns name lowercase
+names(business_all) <- tolower(names(business_all))
+
+# identifying duplicate columns
+dup_cols <- names(business_all)[grepl("\\.1$", names(business_all))]
+
+# looping through duplicate columns and merging them
+for(col in dup_cols) {
+  # original column = without ".1"
+  orig_col <- sub("\\.1", "", col)
+  
+  if(orig_col %in% names(business_all)) {
+    # merging numeric columns by summing
+    if(is.numeric(business_all[[orig_col]])) {
+      business_all[[orig_col]] <- rowSums(business_all[, c(orig_col, col)], na.rm = TRUE)
+    } else {
+      # merging non-numeric columns by taking first non-NA
+      business_all[[orig_col]] <- apply(business_all[, c(orig_col, col)], 1, function(x) {
+        x[!is.na(x)][1]
+      })
+    }
+    
+  } else{
+    # if somehow original column doesn't exist, renaming ".1" column
+    names(business_all)[names(business_all) == col] <- orig_col
+  }
+}
+
+
+# removing all ".1" columns after merging
+business_all <- business_all[, !grepl("\\.1$", names(business_all))]
+
+```
+
+```{r}
+
+# renaming "cty_name" to "county"
+
+names(business_all)[names(business_all) == "cty_name"] <- "county"
+
+
+```
+
+```{r}
+
+# filling every row in "county"
+
+business_all$county <- "CUYAHOGA"
+
+```
+
+```{r}
+
+# removing "stabbr" column
+
+business_all$stabbr <- NULL
+
+```
+
+```{r}
+
+# adding a new variable for pre- + post-2012
+
+business_all <- business_all %>%
+  mutate(
+    period = case_when(
+      year < 2012 ~ "pre_2012",
+      year >= 2012 ~ "post_2012"
+    ),
+    period = factor(period, levels = c("pre_2012", "post_2012"))
+  )
+
+```
+
+```{r}
+
+# removing unnecessary columns in population data
+
+pop_blocks <- pop_blocks %>%
+  select(-c(NAME20, UR20, UACE20, UATYPE20, FUNCSTAT20, ALAND20, AWATER20, HOUSING20, POP20, NAME.y))
+
+# renaming value = NAME.x
+
+pop_blocks <- pop_blocks %>%
+  rename(
+    population = value,
+    details = NAME.x
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+SAVING DATASETS FOR EASY READING IN
+
+```{r}
+
+# saving business_all so I don't have to rerun everything
+
+write.csv(business_all, "business_all.csv", row.names = FALSE)
+
+# saving walkscore data
+
+write.csv(walkscores, "walkscore_results.csv", row.names = FALSE)
+
+# saving population data
+
+saveRDS(pop_blocks, "pop_blocks.rds")
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RESTAURANT DATA - SERPAPI
+
+
+
+```{r}
+
+# setting up api key
+
+api_key <- "d6e35d2edbcc791aa74a9c9c4eeef90c9f03a2c1bc6ccdb3e225fb145c53c1cd"
+
+
+# creating list of coordinates for each city using "ll" format required by serpapi
+
+city_coords <- list(
+  "Lakewood, Ohio" = "@41.4815,-81.7982,14z",
+  "Berea, Ohio" = "@41.3687,-81.8546,14z",
+  "North Royalton, Ohio" = "@41.3118,-81.7512,14z",
+  "Maple Heights, Ohio" = "@41.4233,-81.5873,14z",
+  "Strongsville, Ohio" = "@41.3148,-81.8357,14z"
+)
+
+# defining function to scrape restaurant data for each city, up to max_pages of results
+
+get_all_restaurants <- function(city, max_pages = 100) {
+  
+  # url for serpapi search
+  base_url <- "https://serpapi.com/search.json"
+  
+  # list to stores data for each page
+  all_results <- list()
+  
+  # getting the coords for each city
+  ll <- city_coords[[city]]
+  
+  # if coords aren't found, stop function
+  if (is.null(ll)) {
+    stop("Coordinates not found for city: ", city)
+  }
+  
+  # looping through all pages, adjusting the start offset for pagination (20 results per page)
+  for (page_num in 0:(max_pages - 1)) {
+    start_offset <- page_num * 20
+    
+    # building list of query parameters for api call
+    params <- list(
+      engine = "google_maps",
+      type = "search",
+      q = paste("restaurants in", city),
+      google_domain = "google.com",
+      hl = "en",
+      gl = "us",
+      api_key = api_key,
+      start = start_offset,
+      ll = ll
+    )
+    
+    # message of progress
+    message(paste("Fetching", city, "- Page", page_num + 1, "| Start offset =", start_offset))
+    
+    # sending GET request
+    res <- GET(base_url, query = params)
+    
+    # if status isn't OK (200), giving warning and stop loop
+    if (status_code(res) != 200) {
+      warning(paste("Failed to retrieve data for", city, "on page", page_num + 1))
+      break
+    }
+    
+    # extracting the response body as text
+    content_text <- content(res, as = "text", encoding = "UTF-8")
+    
+    # parsing into R object using fromJSON
+    data <- fromJSON(content_text)
+    
+    # converting data into tibbke
+    if (!is.null(data$local_results) && length(data$local_results) > 0) {
+      df <- as_tibble(data$local_results)
+      df$city <- city  # track city name
+      all_results[[length(all_results) + 1]] <- df
+    } else {
+      message(paste("No more results for", city, "at offset", start_offset))
+      break
+    }
+    
+    # waiting 1 second to avoid rate limiting
+    Sys.sleep(1) 
+  }
+  
+  # returning NULL if no data collected
+  if (length(all_results) == 0) return(NULL)
+  
+  # combining all pages into one dataframe
+  combined <- bind_rows(all_results)
+  return(combined)
+}
+
+
+```
+
+
+
+
+
+CLEANING
+```{r}
+
+# getting list of city names
+cities <- names(city_coords)
+
+# applying get_all_restaurants function to each city
+all_data <- lapply(cities, get_all_restaurants, max_pages = 100)
+
+# filtering out any cities that returned NULL
+all_data <- Filter(Negate(is.null), all_data)
+
+# combining results from all cities
+final_restaurants <- bind_rows(all_data)
+
+# printing total number of restaurants and how many from each city
+print(paste("Total restaurants collected:", nrow(final_restaurants)))
+print(table(final_restaurants$city))
+
+# flattening data frame to remove nested lists
+final_restaurants_flat <- flatten(final_restaurants)
+
+# identifying columns that are lists
+list_cols <- sapply(final_restaurants_flat, is.list)
+print(names(final_restaurants_flat)[list_cols])
+
+# removing columns that are lists (and don't need for analysis)
+final_restaurants_flat <- final_restaurants %>%
+  select(-types, -type_ids, -extensions, -unsupported_extensions, -operating_hours, -service_options)
+
+# flattening gps coords
+final_restaurants_flat <- final_restaurants_flat %>%
+  
+  # adding latitude and longitude columns from the gps_coordinates df-column
+  mutate(
+    latitude = gps_coordinates$latitude,
+    longitude = gps_coordinates$longitude
+  ) %>%
+  
+  # removing the original gps_coordinates column since we extracted what we want
+  select(-gps_coordinates)
+
+# splitting "city" into "city" and "state" + renaming gps coords
+final_restaurants_flat <- final_restaurants_flat %>%
+  separate(city, into = c("city", "state"), sep = ", ") %>%
+  rename(
+    latitude = gps_coordinates.latitude,
+    longitude = gps_coordinates.longitude
+  )
+
+```
+
+
+```{r}
+
+# defining latitude and longitude ranges
+cleaned_restaurants_list <- list()
+
+for(city_name in unique(blocks_with_scores$city)) {
+  
+  city_polygon <- blocks_with_scores %>%
+    filter(city == city_name)
+  
+  city_restaurants <- final_restaurants_flat %>%
+    filter(city == city_name)
+  
+  # making sure CRS matches
+  city_restaurants <- st_transform(city_restaurants, st_crs(city_polygon))
+  
+  # only keeping points inside city polygon
+  inside_idx <- st_within(city_restaurants, city_polygon, sparse = FALSE)[,1]
+  
+  city_restaurants_clean <- city_restaurants[inside_idx, ]
+  
+  cleaned_restaurants_list[[city_name]] <- city_restaurants_clean
+}
+
+restaurant_sf_clean <- do.call(rbind, cleaned_restaurants_list)
+
+
+
+
+```
+
+
+SAVING AS CSV
+```{r}
+
+# saving the file as CSV
+write.csv(final_restaurants_flat, "restaurant_data.csv", row.names = FALSE)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ONLY NEED TO RUN THIS FROM NOW ON
+
+
+
+```{r}
+
+# reading in business dataset
+business_all <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\business_all.csv")
+
+# reading in walkability dataset
+walkscores <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\walkscore_results.csv")
+
+# converting GEOID into string (preserving all digits)
+walkscores <- walkscores %>%
+  mutate(GEOID = format(GEOID, scientific = FALSE))
+
+# reading in population dataset
+pop_blocks <- readRDS("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\pop_blocks.rds")
+
+pop_blocks <- st_transform(pop_blocks, 4326)
+
+# reading in restaurant dataset
+library(readr)
+
+restaurant_data <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\restaurant_data.csv")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+NUMBER OF BUSINESSES PER YEAR BY CITY
+
+
+```{r}
+
+# making sure "est" in numeric
+
+business_all <- business_all %>%
+  mutate(est = as.numeric(est))   
+
+# counting number of businesses per city-year
+
+business_trends <- business_all %>%
+  group_by(city, year, period) %>%
+  summarise(num_businesses = sum(est, na.rm = TRUE), .groups = "drop")
+
+# plotting the lineplot
+ggplot(business_trends, aes(x = year, y = num_businesses, color = city)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2012, linetype = "dashed", color = "red", size = 1) +
+  annotate("text", x = 1999, y = max(business_trends$num_businesses, na.rm = TRUE) * 0.95,
+           label = "CBP + NES Combined (2012)",
+           color = "red", hjust = 0, size = 3) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Number of Businesses Over Time",
+    x = "Year",
+    y = "Number of Businesses",
+    color = "City"
+  )
+
+```
+
+There is a clear jump in the number of businesses in 2012. This is due to the fact that the CBP and NES combined report started in 2012.
+
+```{r}
+
+# creating graphs for each period (pre / post-2012)
+
+ggplot(data = business_trends, aes(x = year, y = num_businesses, color = city)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ period, scales = "free_x") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Number of Business Over Time",
+    x = "Year",
+    y = "Number of Businesses",
+    color = "City"
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+YEAR OVER YEAR CHANGE BY CITY
+
+```{r}
+
+# forcing "city" in character and removing NAs
+
+business_all <- business_all %>%
+  mutate(city = as.character(city)) %>%
+  filter(!is.na(city))
+
+# calculating absolute change & percent change in number of businesses
+
+business_trends <- business_all %>%
+  group_by(city, year) %>%
+  summarise(num_businesses = sum(est, na.rm = TRUE), .groups = "drop") %>%
+  arrange(city, year) %>%
+  group_by(city) %>%
+  mutate(
+    abs_change = num_businesses - lag(num_businesses),
+    pct_change = (num_businesses - lag(num_businesses)) / lag(num_businesses) * 100
+  ) %>%
+  ungroup()
+
+# adding period column
+
+business_trends <- business_trends %>%
+  mutate(
+    period = case_when(
+      year < 2012 ~ "pre_2012",
+      year >= 2012 ~ "post_2012"
+    ),
+    period = factor(period, levels = c("pre_2012", "post_2012"))
+  )
+
+```
+
+```{r}
+
+# plotting results
+
+ggplot(business_trends, aes(x = year, y = pct_change, color = city)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  geom_vline(xintercept = 2012, linetype = "dashed", color = "red", size = 1) +
+  annotate(
+    "text",
+    x = 2012.5,
+    y = max(business_trends$pct_change, na.rm = TRUE) * 0.95,
+    label = "CBP + NES Combined (2012)",
+    clor = "red",
+    hjust = 0,
+    size = 3
+  ) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Year-over-Year Percent Change in Number of Businesses",
+    x = "Year",
+    y = "Percent Change (%)",
+    color = "City"
+  )
+
+```
+
+```{r}
+
+# accounting for pre + post-2012
+
+ggplot(business_trends, aes(x = year, y = pct_change, color = city)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  facet_wrap(~ period, scales = "free_x") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Year-over-Year Percent Change in Number of Businesses",
+    x = "Year",
+    y = "Percent Change (%)",
+    color = "City"
+  )
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DO WALK SCORES DIFFER BY BLOCK?
+
+```{r}
+
+# number of unique census blocks
+
+length(unique(walkscores$GEOID))
+
+```
+
+```{r}
+
+# seeing how much walk scores differ across blocks by city
+
+city_walk_summary <- restaurant_walkscores %>%
+  group_by(city) %>%
+  summarise(
+    n_blocks = n(),
+    min_walkscore = min(walkscore_smooth, na.rm = TRUE),
+    max_walkscore = max(walkscore_smooth, na.rm = TRUE),
+    mean_walkscore = mean(walkscore_smooth, na.rm = TRUE),
+    sd_walkscore = sd(walkscore_smooth, na.rm = TRUE),
+    cv_walkscore = sd_walkscore / mean_walkscore,
+  ) %>%
+  arrange(desc(mean_walkscore))
+
+city_walk_summary
+
+
+```
+
+
+```{r}
+
+# reading in blocks shapefile
+
+blocks_in_places <- st_read("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\blocks_in_places.gpkg")
+
+# removing duplicate rows
+blocks_in_places <- blocks_in_places %>%
+  group_by(GEOID20) %>%
+  slice(1) %>%
+  ungroup()
+
+
+```
+
+```{r}
+
+# combining walkscore and block data
+
+walkscores$GEOID <- as.character(walkscores$GEOID)
+
+blocks_with_scores <- blocks_in_places %>%
+  left_join(walkscores, by = c("GEOID20" = "GEOID"))
+
+```
+
+```{r}
+
+# converting walkscore column to numeric
+
+blocks_with_scores$walkscore <- as.numeric(blocks_with_scores$walkscore)
+
+# removing rows that have NAs for walkscore
+
+blocks_with_scores <- blocks_with_scores %>%
+  filter(!is.na(walkscore))
+
+# looping through each city
+
+for(city_name in unique(blocks_with_scores$city)) {
+  
+  # filtering for that city and plotting an sf object
+  
+  city_blocks <- blocks_with_scores %>%
+    filter(city == city_name)
+  
+  p <- ggplot(city_blocks) +
+    
+    geom_sf(aes(fill = walkscore), color = "white", size = 0.1) +
+    
+    scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+    
+    theme_minimal(base_size = 14) +
+    
+    labs(title = paste("Walk Scores in", city_name),
+         fill = "Walk Score") +
+    
+    theme(axis.text = element_blank(), axis.ticks = element_blank())
+  
+  # saving the map
+  
+  ggsave(paste0("city_maps/", gsub(" ", "_", city_name), "_walkscore.png"),
+         plot = p, width = 12, height = 10, dpi = 300)
+}
+
+```
+
+
+
+
+
+```{r}
+
+# boxplot to show the spread, median, and outliers of walk scores by city
+
+ggplot(restaurant_walkscores, aes(x = reorder(city, walkscore_smooth, FUN = median), y = walkscore_smooth)) +
+  geom_violin(fill = "springgreen4", alpha = 0.6, trim = FALSE) +
+  coord_flip() +
+  labs(
+    title = "How Walk Scores Vary Within Each City",
+    x = "City",
+    y = "Walk Score"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+WALK SCORES BY CITY
+
+```{r}
+
+# vector of columns to convert
+
+cols <- c("n1_4","n5_9","n10_19","n20_49","n50_99","n100_249","n250_499","n500_999","n1000")
+
+# converting to numeric
+
+business_all[cols] <- lapply(business_all[cols], function(x) as.numeric(as.character(x)))
+
+
+city_business_summary <- business_all %>%
+  group_by(city, state, year) %>% 
+  summarise(
+    total_businesses = sum(n1_4, n5_9, n10_19, n20_49, n50_99, n100_249, n250_499, n500_999, n1000, na.rm = TRUE),
+    small_businesses = sum(n1_4, n5_9, n10_19, na.rm = TRUE),
+    medium_businesses = sum(n20_49, n50_99, n100_249, na.rm = TRUE),
+    large_businesses = sum(n250_499, n500_999, n1000, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+COEFFICIENT OF VARIATION (CV) PLOT
+
+```{r}
+
+ggplot(city_walk_summary, aes(x = reorder(city, cv_walkscore), y = cv_walkscore)) +
+  geom_col(fill = "springgreen4") +
+  coord_flip() +
+  labs(
+    title = "Relative Walk Score Variability by City",
+    subtitle = "Higher CV = More Variation Relative to Average",
+    x = "City",
+    y = "Coefficient of Variation (CV)"
+  ) +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+POPULATION PER BLOCK
+
+```{r}
+
+# Chlorepleth Maps
+
+# getting census blocks with population data
+centroids <- st_centroid(pop_blocks)
+
+# extracting coordinates from centroid points
+coords <- st_coordinates(centroids)
+
+# adding centroid coordinates to pop_blocks dataset
+pop_blocks <- pop_blocks %>%
+  mutate(lon = coords[,1],
+         lat = coords[,2])
+
+# filtering out erroneous points that fall outside lakewood bounds
+pop_blocks <- pop_blocks %>%
+  filter(!(city == "Lakewood" & lat > 41.5))
+
+# looping through each unique city
+for (city_name in unique(pop_blocks$city)) {
+  
+  # filtering population blocks to include only those with city_name
+  city_blocks <- pop_blocks %>%
+    filter(city == city_name)
+  
+  # creating population chlorepleth map
+  p <- ggplot(city_blocks) +
+    geom_sf(aes(fill = population), color = "white", size = 0.1) +
+    scale_fill_viridis_c(option = "magma", na.value = "grey80") +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Population by Block in", city_name, "(2020)"),
+      fill = "Population"
+    )
+  
+  # saving the plot as PNG file
+  ggsave(
+    filename = paste0("population_maps/", gsub(" ", "_", city_name), "_population.png"),
+    plot = p,
+    width = 12,
+    height = 10,
+    dpi = 300
+  )
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RESTAURANT DATA + WALKSCORE + POPULATION MAPS
+
+
+```{r}
+
+# Walk Score + Restaurant Chlorepleth Maps
+
+# converting restaurant data to sf
+restaurants_sf <- st_as_sf(restaurant_data, coords = c("longitude", "latitude"), crs = 4326)
+
+# making sure datasets have same CRS
+restaurants_sf <- st_transform(restaurants_sf, st_crs(4326))
+
+# using city polygons
+city_boundaries <- blocks_with_scores %>%
+  group_by(city) %>%
+  summarise()
+
+# spatial join - assigning spatial city to each restaurant (removing outlier points)
+restaurants_checked <- st_join(
+  restaurants_sf,
+  city_boundaries %>% select(city),
+  join = st_within,
+  left = TRUE
+)
+
+# renaming columns
+restaurants_checked <- restaurants_checked %>%
+  rename(city_reported = city.x,
+         city_spatial = city.y)
+
+# looping over each city
+for(city_name in unique(blocks_with_scores$city)) {
+  
+  # filtering block data for city
+  city_blocks <- blocks_with_scores %>%
+    filter(city == city_name)
+  
+  # filtering restaurants for city
+  city_restaurants <- restaurants_checked %>%
+    filter(city_spatial == city_name)
+  
+  p <- ggplot(city_blocks) +
+    geom_sf(aes(fill = walkscore), color = "white", size = 0.1) +
+    geom_sf(
+      data = city_restaurants,
+      shape = 21,
+      fill = "black",
+      color = "white",
+      size = 2,
+      stroke = 0.3,
+      alpha = 0.8) +
+    scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+    theme_minimal(base_size = 14) +
+    labs(title = paste("Walk Scores and Restaurants in", city_name),
+         fill = "Walk Score") +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank())
+  
+  ggsave(
+    filename = paste0("walkscore_restaurants/", gsub(" ", "_", city_name), "_walkscore_restaurants.png"),
+    plot = p,
+    width = 12,
+    height = 10,
+    dpi = 300
+  )
+}
+
+
+```
+
+
+
+
+
+
+
+```{r}
+# Population + Restaurant Chlorepleth Maps
+
+# looping over each city
+for (city_name in unique(pop_blocks$city)) {
+  
+  # filtering blocks for city
+  city_blocks <- pop_blocks %>%
+    filter(city == city_name) %>%
+    mutate(pop_fill = ifelse(is.na(population) | population == 0, NA, population))
+  
+  # filtering restaurants for city
+  city_restaurants <- restaurants_checked %>%
+    filter(city_spatial == city_name)
+  
+  # creating maps
+  p <- ggplot(city_blocks) +
+    geom_sf(aes(fill = pop_fill), color = "white", size = 0.1) +
+    { if (nrow(city_restaurants) > 0)
+    geom_sf(data = city_restaurants,
+      shape = 21,
+      fill = "white",
+      color = "black",
+      size = 2,
+      stroke = 0.3,
+      alpha = 0.8)
+    } +
+    scale_fill_viridis_c(option = "magma", na.value = "black") +
+    theme_minimal(base_size = 14) +
+    labs(
+      title = paste("Population and Restaurants in", city_name, "(2020)"),
+      fill = "Population"
+    ) +
+    theme(
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank()
+    )
+  
+  # saving png
+  ggsave(
+    filename = paste0("population_restaurants/", gsub(" ", "_", city_name), "_population_restaurants.png"),
+    plot = p,
+    width = 12,
+    height = 10,
+    dpi = 300
+  )
+}
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RESTAURANTS + WALKSCORES WITH SMOOTHENING
+
+```{r}
+
+# Smoothed Walk Score Maps
+
+
+# ensuring geometry is active
+st_geometry(blocks_with_scores) <- "geom"
+blocks_with_scores <- st_transform(blocks_with_scores, 4326)
+
+restaurants_sf <- st_as_sf(restaurant_data, coords = c("longitude", "latitude"), crs = 4326)
+restaurants_sf <- st_transform(restaurants_sf, st_crs(blocks_with_scores))
+st_geometry(restaurants_sf) <- "geometry"
+
+# outputting directory
+out_dir <- "walkscore_restaurants_knn"
+if(!dir.exists(out_dir)) dir.create(out_dir)
+
+# creating function to compute KNN-smoothed walkscore
+smooth_walkscore_knn <- function(blocks, k = 5) {
+  coords <- st_coordinates(st_centroid(blocks))
+  knn_idx <- get.knn(coords, k = k)$nn.index
+
+  smoothed <- numeric(nrow(blocks))
+  for(i in seq_len(nrow(blocks))) {
+    neighbors <- knn_idx[i, ]
+    smoothed[i] <- mean(blocks$walkscore[c(i, neighbors)], na.rm = TRUE)
+  }
+  return(smoothed)
+}
+
+# looping over cities
+for(city_name in unique(blocks_with_scores$city)) {
+
+  city_blocks <- blocks_with_scores %>% filter(city == city_name)
+  if(nrow(city_blocks) == 0) next
+
+  # smoothing walkscore
+  city_blocks <- city_blocks %>%
+    mutate(walkscore_smooth = smooth_walkscore_knn(city_blocks, k = 5))
+
+  # getting restaurants within each city
+  city_union <- st_union(city_blocks)
+  within_idx <- st_within(restaurants_sf, city_union)
+  city_restaurants <- restaurants_sf[lengths(within_idx) > 0, ]
+
+  # plotting
+  p <- ggplot() +
+    geom_sf(data = city_blocks, aes(fill = walkscore_smooth), color = NA) +
+    geom_sf(data = city_blocks, fill = NA, color = "white", size = 0.2) +
+    geom_sf(data = city_restaurants, shape = 21, fill = "black", color = "white",
+            size = 2, stroke = 0.3, alpha = 0.8) +
+    scale_fill_viridis_c(option = "plasma", na.value = "grey80") +
+    theme_minimal(base_size = 14) +
+    labs(title = paste("KNN Smoothed Walk Scores in", city_name),
+         fill = "Walk Score") +
+    theme(axis.text = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid = element_blank())
+
+  # saving plot
+  ggsave(
+    filename = paste0(out_dir, "/", gsub(" ", "_", city_name), "_walkscore_knn.png"),
+    plot = p,
+    width = 12,
+    height = 10,
+    dpi = 300
+  )
+}
+
+
+
+```
+
+
+```{r}
+
+# Adding smoothed walkscores into new df
+
+# 
+all_city_blocks <- list()
+
+for(city_name in unique(blocks_with_scores$city)) {
+  city_blocks <- blocks_with_scores %>%
+    filter(city == city_name)
+  if(nrow(city_blocks) == 0) next
+  
+  city_blocks <- city_blocks %>%
+    mutate(walkscore_smooth = smooth_walkscore_knn(city_blocks, k = 5))
+  
+  all_city_blocks[[city_name]] <- city_blocks
+}
+
+# combining into one sf object
+blocks_with_scores_smoothed <- do.call(rbind, all_city_blocks)
+
+# saving results
+st_write(blocks_with_scores_smoothed, "walkscore_restaurants_knn/smoothed_walkscores.geojson", delete_dsn = TRUE)
+
+```
+
+
+
+```{r}
+
+# Assigning walkscores to restaurants based on block
+
+# creating unique restaurant id
+restaurants_sf <- restaurants_sf %>%
+  mutate(unique_id = paste(place_id, address, sep = "_"))
+
+# assigning smoothed block walkscores to restaurants
+restaurant_walkscores <- st_join(
+  restaurants_sf,
+  blocks_with_scores_smoothed %>%
+    select(GEOID20, walkscore_smooth),
+  join = st_within,
+  left = TRUE
+)
+
+restaurant_walkscores <- restaurant_walkscores %>%
+  group_by(unique_id) %>%
+  slice(1) %>%
+  ungroup()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+CALCULATING RESTAURANT "AGE"
+
+
+```{r}
+
+# Calculating longevity for each restaurant
+
+# adding a column for "age" in years
+current_year = 2025
+
+restaurant_walkscores <- restaurant_walkscores %>%
+  mutate(
+    age_years = current_year - opening_year
+  )
+
+```
+
+
+
+
+
+
+
+
+EXPLORATORY ANALYSIS
+
+
+```{r}
+
+# Relationship between walkscore and age
+
+# defining color palette
+city_colors <- c(
+  "Lakewood" = "#1B9EFF",
+  "Maple Heights" = "#D95F02",
+  "Berea" = "goldenrod2",
+  "Strongsville" = "#7570B3",
+  "North Royalton" = "#20B2AA"
+)
+
+# creating plot
+ggplot(restaurant_walkscores, aes(x = walkscore_smooth, y = age_years, color = city)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  scale_color_manual(values = city_colors)
+  theme_minimal() +
+  labs(
+    x = "Smoothed Walk Score",
+    y = "Years Open",
+    color = "City",
+    title = "Restaurant Longevity vs Walkability",
+    caption = "Note: Opening years were collected from online sources and\n may not reflect the exact date; restaurant ages are approximate."
+  ) +
+  theme(
+    plot.caption = element_text(size = 10, color = "gray40", hjust = 0),
+    
+    )
+
+```
+
+
+
+```{r}
+
+# Kruskal-Wallis Test
+
+kruskal.test(age_years ~ city, data = restaurant_walkscores)
+
+# pairwise comparisons
+pairwise.wilcox.test(
+  restaurant_walkscores$age_years, restaurant_walkscores$city,
+  p.adjust.method = "BH")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DETERMINING WHICH RESTAURANTS ARE CHAINS
+
+
+Restaurants are classified as chains if they are part of a recognized nations or regional brand; otherwise they are categorized as standalone. Multiple locations of the same restaurant were not automatically classified as a chain.
+
+```{r}
+
+# Creating a chain column
+
+# making list of chain restaurant names
+chain_names <- c(
+  "Buca di Beppo Italian Restaurant", 
+  "Aladdin’s Eatery", 
+  "Dave’s Hot Chicken",
+  "Raising Cane’s Chicken Fingers", 
+  "Mr. Hero", 
+  "Domino’s Pizza", 
+  "Taco Bell",
+  "Wingstop", 
+  "Chipotle Mexican Grill", 
+  "Donatos Pizza", 
+  "McDonald’s", 
+  "Burger King", 
+  "KFC", 
+  "Jimmy John’s", 
+  "Subway", 
+  "Dairy Queen / Orange Julius",
+  "Little Caesars Pizza", 
+  "Panera Bread",
+  "Papa Johns Pizza",
+  "Pizza Hut",
+  "Buffalo Wild Wings",
+  "Arby’s",
+  "Firehouse Subs",
+  "Freddy's Frozen Custard & Steakburgers",
+  "Bruegger’s Bagels",
+  "Sbarro",
+  "QDOBA Mexican Eats",
+  "Outback Steakhouse",
+  "LongHorn Steakhouse",
+  "Culver’s",
+  "Chick-fil-A",
+  "Jersey Mike’s",
+  "BIBIBOP Asian Grill",
+  "Hot Head Burritos",
+  "Tommy's Pizza, Chicken & Catering",
+  "Poke & Ramen",
+  "Potbelly",
+  "Marco’s Pizza",
+  "Giovanni’s Pizza, Subs, and Wings",
+  "Auntie Anne’s",
+  "Dunkin’",
+  "Master Pizza"
+)
+
+# flagging restaurants as chain
+restaurant_walkscores <- restaurant_walkscores %>%
+  mutate(chain = ifelse(title %in% chain_names, "Chain", "Standalone"))
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRAPHING CHAIN VS STANDALONE RESTAURANTS
+
+
+```{r}
+
+# creating boxplot
+
+ggplot(restaurant_walkscores, aes(x = chain, y = age_years, fill = chain)) +
+  geom_boxplot(alpha = 0.8, width = 0.5, outlier.color = "black", outlier.shape = 16) +
+  scale_fill_manual(values = c("Standalone" = "springgreen4", "Chain" = "#1B9EFF")) +
+  theme_minimal(base_size = 14) +
+  theme(panel.background = element_rect(fill = "grey90", color = NA),
+        axis.title.x = element_blank(),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 12)) +
+  labs(
+    y = "Years Open",
+    title = "Longevity of Restaurants: Chain vs Standalone",
+    caption = "Note: Opening years were collected from online sources and\n may not reflect the exact date; restaurant ages are approximate."
+    ) +
+  theme(
+    plot.caption = element_text(size = 10, color = "gray40", hjust = 0)
+  )
+
+```
+
+
+
+```{r}
+
+# Checking for normality between chain and standalone
+
+# QQplot
+ggplot(restaurant_walkscores, aes(sample = age_years)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  theme_minimal() +
+  labs(title = "QQplot of Restaurant Longevity")
+
+```
+Not normally distributed, so need to do Wilcoxon rank-sum test.
+
+
+
+
+```{r}
+
+# Wilcoxon Rank-Sum Test: chain vs standalone
+
+wilcox_result <- wilcox.test(age_years ~ chain, data = restaurant_walkscores)
+
+wilcox_result
+
+
+```
+
+
+KOLMOGOROV SMIRNOV
+
+```{r}
+
+# Kolmogorov Smirnov Test
+
+# splitting data into two groups
+chain_ages <- restaurant_walkscores$age_years[restaurant_walkscores$chain == "Chain"]
+
+standalone_ages <- restaurant_walkscores$age_years[restaurant_walkscores$chain == "Standalone"]
+
+# performing two-sample kolmogorov smirnov test
+ks_result = ks.test(chain_ages, standalone_ages)
+
+ks_result
+
+```
+
+
+```{r}
+
+# ECDF plot
+
+ggplot(restaurant_walkscores, aes(x = age_years, color = chain)) +
+  stat_ecdf(size = 1.2) +
+  theme_minimal(base_size = 14) +
+  scale_color_manual(values = c("Standalone" = "springgreen4", "Chain" = "#1B9EFF")) +
+  labs(
+    title = "Emprical Cumulative Distribution of Restaurant Ages",
+    x = "Years Open",
+    y = "Cumulative Probability",
+    color = "Restaurant Type"
+  )
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+LONGEVITY VS WALKSCORE
+
+```{r}
+
+# Correlation: longevity vs walkscore
+
+# spearman's rank correlation
+cor.test(restaurant_walkscores$walkscore_smooth, restaurant_walkscores$age_years,
+         method = "spearman")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+LINEAR REGRESSION 1: LONGEVITY ~ WALKSCORE
+
+
+```{r}
+
+# Linear Regression
+
+# creating model
+lm1 <- lm(age_years ~ walkscore_smooth, data = restaurant_walkscores)
+
+summary(lm1)
+
+```
+
+
+
+
+LINEAR REGRESSION 2: LONGEIVITY ~ WALKSCORE + CITY
+
+```{r}
+
+# regression 2
+
+lm2 <- lm(age_years ~ walkscore_smooth + city, data = restaurant_walkscores)
+
+summary(lm2)
+
+```
+
+
+
+
+
+
+REGRESSION 3: LONGEVITY ~ WALKSCORE + CITY + CHAIN
+
+```{r}
+
+# regression 3
+
+lm3 <- lm(age_years ~ walkscore_smooth + city + chain, data = restaurant_walkscores)
+
+summary(lm3)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
