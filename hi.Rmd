@@ -67,7 +67,7 @@ get_walkscore <- function(lat, lon, address, api_key) {
 
 # setting walk score api key
 
-api_key = "cd31a2e1ded4ea6447fd05acdb5d1d80"
+api_key = REDACTED
 
 # cities of interest
 
@@ -328,7 +328,7 @@ GETTING POPULATION DATA FOR EACH BLOCK
 
 # intializing my api key
 
-census_api_key("d8b3b3939b81348edb2b3a6945f091b1217bd5ea", install = TRUE)
+census_api_key(REDACTED, install = TRUE)
 
 # getting population + geometry
 
@@ -834,7 +834,7 @@ RESTAURANT DATA - SERPAPI
 
 # setting up api key
 
-api_key <- "d6e35d2edbcc791aa74a9c9c4eeef90c9f03a2c1bc6ccdb3e225fb145c53c1cd"
+api_key <- REDACTED
 
 
 # creating list of coordinates for each city using "ll" format required by serpapi
@@ -1108,24 +1108,24 @@ ONLY NEED TO RUN THIS FROM NOW ON
 ```{r}
 
 # reading in business dataset
-business_all <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\business_all.csv")
+business_all <- read.csv("business_all.csv")
 
 # reading in walkability dataset
-walkscores <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\walkscore_results.csv")
+walkscores <- read.csv("walkscore_results.csv")
 
 # converting GEOID into string (preserving all digits)
 walkscores <- walkscores %>%
   mutate(GEOID = format(GEOID, scientific = FALSE))
 
 # reading in population dataset
-pop_blocks <- readRDS("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\pop_blocks.rds")
+pop_blocks <- readRDS("pop_blocks.rds")
 
 pop_blocks <- st_transform(pop_blocks, 4326)
 
 # reading in restaurant dataset
 library(readr)
 
-restaurant_data <- read.csv("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\restaurant_data.csv")
+restaurant_data <- read.csv("restaurant_data.csv")
 
 ```
 
@@ -1380,7 +1380,7 @@ city_walk_summary
 
 # reading in blocks shapefile
 
-blocks_in_places <- st_read("C:\\Users\\peste\\OneDrive\\Pictures\\School\\Fall 25\\Directed Study\\Directed Study\\Data\\blocks_in_places.gpkg")
+blocks_in_places <- st_read(FILE PATH REDACTED)
 
 # removing duplicate rows
 blocks_in_places <- blocks_in_places %>%
@@ -2529,6 +2529,7 @@ summary(lm3)
 
 
 ```
+
 
 
 
